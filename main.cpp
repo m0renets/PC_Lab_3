@@ -11,8 +11,7 @@
 #include <condition_variable>
 
 #include <algorithm> // DELETE DELETE DELETE DELETE
-#include <cassert> // DELETE DELETE DELETE DELETE
-
+#include <cassert>   // DELETE DELETE DELETE DELETE
 
 #define THREAD_COUNT 2
 #define EXECUTION_INTERVAL 30
@@ -51,9 +50,9 @@ public:
         this_thread::sleep_for(task_time);
 
         {
-            lock_guard lock(cout_mutex);    
-            cout << get_id() << " task is executed time: " << get_time().count() << endl;
-        }        
+            lock_guard lock(cout_mutex);
+            // cout << get_id() << " task is executed time: " << get_time().count() << endl;
+        }
     }
 
 private:
@@ -72,7 +71,7 @@ class task_queue
 
 public:
     task_queue() = default;
-    ~task_queue() {clear();};
+    ~task_queue() { clear(); };
 
     bool empty()
     {
@@ -118,6 +117,22 @@ public:
         tasks.emplace(move(task));
     }
 
+    void push_front(task &&new_task)
+    {
+        write_lock _(rw_lock);
+
+        queue<task> new_queue;
+        new_queue.push(move(new_task));
+
+        while (!tasks.empty())
+        {
+            new_queue.push(move(tasks.front()));
+            tasks.pop();
+        }
+
+        tasks.swap(new_queue);
+    }
+
 private:
     queue<task> tasks;
     mutable shared_mutex rw_lock;
@@ -133,7 +148,7 @@ public:
     bool working()
     {
         read_lock _(rw_lock);
-        return working_unsafe();   
+        return working_unsafe();
     }
 
     bool working_unsafe()
@@ -144,7 +159,7 @@ public:
     void initialize(size_t worker_count)
     {
         write_lock _(rw_lock);
-        
+
         if (initialized || terminated)
         {
             return;
@@ -161,7 +176,7 @@ public:
 
     void routine()
     {
-        while(true)
+        while (true)
         {
             bool task_accquired = false;
 
@@ -169,8 +184,13 @@ public:
 
             {
                 write_lock _(rw_lock);
-                auto wait_condition = [this, &task_accquired, &task] 
+                auto wait_condition = [this, &task_accquired, &task]
                 {
+                    if (execution_paused)
+                    {
+                        return false;
+                    }
+
                     task_accquired = tasks.pop(task);
                     return terminated || task_accquired;
                 };
@@ -183,8 +203,25 @@ public:
                 return;
             }
 
-            task.execute();
-            //cout << task.get_id() << " task is executed< time: " << task.get_time().count() << endl;
+            if (task_accquired)
+            {
+                task.execute();
+            }
+
+            {
+                write_lock _(rw_lock);
+
+                if (!execution_paused)
+                { // If TP is executing yet
+                    lock_guard lock(cout_mutex);
+                    cout << task.get_id() << " task is executed time: " << task.get_time().count() << endl;
+                }
+
+                else // didn`t have time to execute
+                {
+                    tasks.push_front(move(task));
+                }
+            }
         }
     }
 
@@ -203,19 +240,23 @@ public:
             tasks.emplace(move(task));
         }
 
-        task_waiter.notify_one();
+        if (!execution_paused)
+        {
+            task_waiter.notify_one();
+        }
     }
 
     void terminate()
     {
         {
             write_lock _(rw_lock);
-            if(working_unsafe())
+            if (working_unsafe())
             {
                 terminated = true;
             }
 
-            else{
+            else
+            {
                 workers.clear();
                 terminated = false;
                 initialized = false;
@@ -234,42 +275,33 @@ public:
         terminated = false;
         initialized = false;
     }
-    
-    void force_terminate()
+
+    void execution_pause()
     {
-
+        write_lock _(rw_lock);
+        if (working_unsafe() && !execution_paused)
         {
-            write_lock _(rw_lock);
-    
-            if (!working_unsafe())
-            {
-                return;
-            }
-    
-            terminated = true;
+            execution_paused = true;
         }
-     
-        task_waiter.notify_all();
-
-        for (thread &worker : workers)
-        {
-            if (worker.joinable())
-            {
-                worker.join();
-            }
-        }
-
-        workers.clear();
-        terminated = false;
-        initialized = false;
     }
 
+    void execution_resume()
+    {
+        {
+            write_lock _(rw_lock);
+            if (execution_paused)
+            {
+                execution_paused = false;
+            }
+        }
 
+        task_waiter.notify_all();
+    }
 
 private:
-
     bool initialized = false;
     bool terminated = false;
+    bool execution_paused = false;
 
     task_queue tasks;
 
@@ -279,131 +311,134 @@ private:
     mutable condition_variable_any task_waiter;
 };
 
-class task_generator
+class task_manager
 {
-    public:
-    task_generator() = default;
-    ~task_generator() {stop();};
+public:
 
-    void initialize(thread_pool & tp)
+    task_manager() = default;
+    ~task_manager() { terminate(); };
+
+    void initialize()
     {
 
-        lock_guard lock(gen_mtx);
-        if (isWorking)
-        {
-            return;
-        }
+        phase = poolPhase::Accumulation;
+        tp.initialize(THREAD_COUNT);
+        tp.execution_pause();
 
-        isWorking = true;
+        phase_changer = thread(&task_manager::chagePhase, this);
 
         generators.reserve(GENERATOR_THREAD_COUNT);
         for (size_t id = 0; id < GENERATOR_THREAD_COUNT; id++)
         {
-            generators.emplace_back(generate, this, ref(tp));
+            generators.emplace_back(&task_manager::generate_and_try_to_insert_task, this);
         }
     }
 
-    void stop()
+private:
+    void chagePhase()
     {
-
-        lock_guard _(gen_mtx);
-
-        if (!isWorking)
+        while (true)
         {
-            return;
-        }
 
-        {
-            
-            isWorking = false;
-        }
-
-        for (thread &generator : generators)
-        {
-            if (generator.joinable())
             {
-                generator.detach();
+                lock_guard lock(cout_mutex);
+                cout << "Phase: " << (phase == poolPhase::Execution ? "Execution" : "Accumulation") << endl;
+            }
+
+            this_thread::sleep_for(seconds(EXECUTION_INTERVAL));
+
+            if (phase == poolPhase::Execution)
+            {
+                phase = poolPhase::Accumulation;
+                tp.execution_pause();
+            }
+
+            else
+            {
+                phase = poolPhase::Execution;
+                tp.execution_resume();
             }
         }
-
-        generators.clear();
     }
 
-    private:
-
-    void generate(thread_pool & tp)
+    void generate_and_try_to_insert_task()
     {
-
-        static thread_local mt19937 generator(random_device{}());
+        static thread_local mt19937 randTime(random_device{}());
         uniform_int_distribution<int> distribution(GENERATOR_INTERVAL_MIN, GENERATOR_INTERVAL_MAX);
 
         while (true)
         {
 
-            {
-                lock_guard _(gen_mtx);
-                if (!isWorking)
-                {
-                    break;
-                }
-            }
+            seconds waitTime = seconds(distribution(randTime));
+
+            this_thread::sleep_for(seconds(waitTime));
 
             task task;
+            task.task_id = prev_id++;
 
             {
-                lock_guard _(gen_mtx);
-                task.task_id = prev_id++;
-                tp.add_task(move(task));   
+                if (phase == poolPhase::Accumulation)
+                {
+                    {
+                        lock_guard _(tm_mtx);
+                        tp.add_task(move(task));
+                    }
+
+                    {
+                        lock_guard lock(cout_mutex);
+                        cout << "Add task with id: " << task.get_id() << ", time: " << task.get_time().count() << endl;
+                    }
+                }
             }
-
-            {
-                lock_guard lock(cout_mutex);
-                cout << "Add task with id: " << task.get_id() << ", time: " << task.get_time().count() << endl;
-            }
-
-            seconds waitTime = seconds(distribution(generator));
-
-            this_thread::sleep_for(seconds(1));
         }
     }
 
-    vector<thread> generators;
-    bool isWorking = false;
-    mutable shared_mutex gen_mtx;
-};
+    void terminate()
+    {
+        {
+            lock_guard _(tm_mtx);
+            for (thread &gen : generators)
+            {
+                if (gen.joinable())
+                {
+                    gen.join();
+                }
+            }
 
-void test_force_terminate()
-{
-    cout << "Starting test for force_terminate()" << endl;
+            generators.clear();
+        }
+
+        if (phase_changer.joinable())
+        {
+            phase_changer.join();
+        }
+    }
+
+    enum class poolPhase
+    {
+        Accumulation,
+        Execution
+    };
+
+    poolPhase phase = poolPhase::Accumulation;
+
+    thread phase_changer;
+
+    vector<thread> generators;
 
     thread_pool tp;
-    tp.initialize(THREAD_COUNT);
 
-    task_generator tg;
-    tg.initialize(tp);
-
-    this_thread::sleep_for(seconds(5));
-    tg.stop();
-
-    this_thread::sleep_for(seconds(5));
-    tg.initialize(tp);
-
-    cin.get();
-
-}
-
-void print_prevv_id()
-{
-    while (true) {
-        cout << prev_id << endl;
-        this_thread::sleep_for(seconds(1));
-    }
-}
+    mutable shared_mutex tm_mtx;
+};
 
 int main()
 {
 
-    test_force_terminate();
+    task_manager tm;
+
+    tm.initialize();
+
+    cin.get();
 
     return 0;
 }
