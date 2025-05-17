@@ -9,9 +9,8 @@
 #include <atomic>
 #include <random>
 #include <condition_variable>
-
-#include <algorithm> // DELETE DELETE DELETE DELETE
-#include <cassert>   // DELETE DELETE DELETE DELETE
+#include <numeric>
+#include <algorithm>
 
 #define THREAD_COUNT 2
 #define EXECUTION_INTERVAL 30
@@ -31,6 +30,57 @@ atomic<size_t> prev_id = 0;
 
 shared_mutex sync_mtx;
 static mutex cout_mutex;
+
+// Statistic variables
+atomic<size_t> created_threads_count = 0;
+
+vector<duration<double>> wait_times;
+shared_mutex wait_times_mutex;
+
+vector<size_t> queue_sizes;
+mutex queue_stat_mutex;
+
+vector<seconds> execution_times;
+mutex execution_times_mtx;
+
+double get_average_wait_time()
+{
+
+    lock_guard lock(wait_times_mutex);
+
+    if (wait_times.empty())
+    {
+        return 0.0;
+    }
+
+    duration<double> total_wait_time = accumulate(wait_times.begin(), wait_times.end(), duration<double>(0));
+    return total_wait_time.count() / wait_times.size();
+}
+
+double get_average_queue_length()
+{
+    lock_guard lock(queue_stat_mutex);
+    if (queue_sizes.empty())
+    {
+        return 0.0;
+    }
+
+    size_t sum = accumulate(queue_sizes.begin(), queue_sizes.end(), 0);
+    return static_cast<double>(sum) / queue_sizes.size();
+}
+
+double get_average_execution_time()
+{
+    lock_guard lock(execution_times_mtx);
+
+    if (execution_times.empty())
+        return 0.0;
+
+    duration<double> total_wait_time = accumulate(execution_times.begin(), execution_times.end(), duration<double>(0));
+
+
+    return total_wait_time.count() / execution_times.size();
+}
 
 class task
 {
@@ -93,6 +143,11 @@ public:
         {
             tasks.pop();
         }
+
+        {
+            lock_guard lock(queue_stat_mutex);
+            queue_sizes.push_back(tasks.size());
+        }
     }
 
     bool pop(task &task)
@@ -107,6 +162,12 @@ public:
         {
             task = move(tasks.front());
             tasks.pop();
+
+            {
+                lock_guard lock(queue_stat_mutex);
+                queue_sizes.push_back(tasks.size());
+            }
+
             return true;
         }
     }
@@ -115,6 +176,11 @@ public:
     {
         write_lock _(rw_lock);
         tasks.emplace(move(task));
+        
+        {
+            lock_guard lock(queue_stat_mutex);
+            queue_sizes.push_back(tasks.size());
+        }
     }
 
     void push_front(task &&new_task)
@@ -131,6 +197,11 @@ public:
         }
 
         tasks.swap(new_queue);
+        
+        {
+            lock_guard lock(queue_stat_mutex);
+            queue_sizes.push_back(tasks.size());
+        }
     }
 
 private:
@@ -169,6 +240,7 @@ public:
         for (size_t id = 0; id < worker_count; id++)
         {
             workers.emplace_back(routine, this);
+            created_threads_count++;
         }
 
         initialized = !workers.empty();
@@ -181,6 +253,8 @@ public:
             bool task_accquired = false;
 
             task task;
+
+            auto wait_start = steady_clock::now();
 
             {
                 write_lock _(rw_lock);
@@ -198,23 +272,49 @@ public:
                 task_waiter.wait(_, wait_condition);
             }
 
+            auto wait_end = steady_clock::now();
+            duration<double> wait_duration = wait_end - wait_start;
+
+            {
+                lock_guard lock(wait_times_mutex);
+                wait_times.push_back(wait_duration);
+            }
+
             if (terminated && !task_accquired)
             {
                 return;
             }
 
+            seconds exec_time;
+
             if (task_accquired)
             {
+                auto start_time = steady_clock::now();
+
                 task.execute();
+
+                auto end_time = steady_clock::now();
+                exec_time = duration_cast<seconds>(end_time - start_time);
+
+            }
+
+            if (terminated)
+            {
+                return;
             }
 
             {
                 write_lock _(rw_lock);
 
-                if (!execution_paused)
-                { // If TP is executing yet
+                if (!execution_paused) // If TP is executing yet
+                { 
                     lock_guard lock(cout_mutex);
                     cout << task.get_id() << " task is executed time: " << task.get_time().count() << endl;
+
+                    {
+                        lock_guard lock(execution_times_mtx);
+                        execution_times.push_back(exec_time);
+                    }
                 }
 
                 else // didn`t have time to execute
@@ -268,7 +368,10 @@ public:
 
         for (thread &worker : workers)
         {
-            worker.join();
+            if (worker.joinable())
+            {
+                worker.join();
+            }
         }
 
         workers.clear();
@@ -325,19 +428,49 @@ public:
         tp.initialize(THREAD_COUNT);
         tp.execution_pause();
 
+        terminated = false;
+
         phase_changer = thread(&task_manager::chagePhase, this);
+        created_threads_count++;
 
         generators.reserve(GENERATOR_THREAD_COUNT);
         for (size_t id = 0; id < GENERATOR_THREAD_COUNT; id++)
         {
             generators.emplace_back(&task_manager::generate_and_try_to_insert_task, this);
+            created_threads_count++;
         }
+    }
+
+    void terminate()
+    {
+
+        {
+            lock_guard _(tm_mtx);
+            terminated = true;
+        }
+
+        if (phase_changer.joinable())
+        {
+            phase_changer.join();
+        }
+
+        tp.terminate();
+
+        for (thread &gen : generators)
+        {
+            if (gen.joinable())
+            {
+                gen.join();
+            }
+        }
+
+        generators.clear();
     }
 
 private:
     void chagePhase()
     {
-        while (true)
+        while (!terminated)
         {
 
             {
@@ -346,6 +479,11 @@ private:
             }
 
             this_thread::sleep_for(seconds(EXECUTION_INTERVAL));
+
+            if(terminated)
+            {
+                return;
+            }
 
             if (phase == poolPhase::Execution)
             {
@@ -366,21 +504,26 @@ private:
         static thread_local mt19937 randTime(random_device{}());
         uniform_int_distribution<int> distribution(GENERATOR_INTERVAL_MIN, GENERATOR_INTERVAL_MAX);
 
-        while (true)
+        while (!terminated)
         {
 
             seconds waitTime = seconds(distribution(randTime));
 
             this_thread::sleep_for(seconds(waitTime));
 
+            if (terminated)
+            {
+                return;
+            }
+
             task task;
             task.task_id = prev_id++;
 
             {
+                lock_guard _(tm_mtx);
                 if (phase == poolPhase::Accumulation)
                 {
                     {
-                        lock_guard _(tm_mtx);
                         tp.add_task(move(task));
                     }
 
@@ -390,27 +533,6 @@ private:
                     }
                 }
             }
-        }
-    }
-
-    void terminate()
-    {
-        {
-            lock_guard _(tm_mtx);
-            for (thread &gen : generators)
-            {
-                if (gen.joinable())
-                {
-                    gen.join();
-                }
-            }
-
-            generators.clear();
-        }
-
-        if (phase_changer.joinable())
-        {
-            phase_changer.join();
         }
     }
 
@@ -429,6 +551,8 @@ private:
     thread_pool tp;
 
     mutable shared_mutex tm_mtx;
+
+    bool terminated = false;
 };
 
 int main()
@@ -439,6 +563,16 @@ int main()
     tm.initialize();
 
     cin.get();
+
+    cout << "Counts of created threads: " << created_threads_count.load() << endl;
+
+    cout << "Average threads wait time: " << get_average_wait_time() << " seconds" << endl;
+
+    cout << "Average queue length: " << get_average_queue_length() << endl;
+
+    cout << "Average execution time: " << get_average_execution_time() << " seconds" << endl;
+    
+    tm.terminate();
 
     return 0;
 }
